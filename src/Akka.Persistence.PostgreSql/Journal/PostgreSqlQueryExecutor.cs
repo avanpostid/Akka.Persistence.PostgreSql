@@ -18,6 +18,8 @@ using System.Data;
 using System.Data.Common;
 using System.Linq;
 using System.Text;
+using System.Threading;
+using System.Threading.Tasks;
 
 namespace Akka.Persistence.PostgreSql.Journal
 {
@@ -27,12 +29,13 @@ namespace Akka.Persistence.PostgreSql.Journal
         private readonly Func<IPersistentRepresentation, SerializationResult> _serialize;
         private readonly Func<Type, object, string, int?, object> _deserialize;
 
-        public PostgreSqlQueryExecutor(PostgreSqlQueryConfiguration configuration, Akka.Serialization.Serialization serialization, ITimestampProvider timestampProvider)
+        public PostgreSqlQueryExecutor(PostgreSqlQueryConfiguration configuration,
+            Akka.Serialization.Serialization serialization, ITimestampProvider timestampProvider)
             : base(configuration, serialization, timestampProvider)
         {
             _configuration = configuration;
             var storedAs = configuration.StoredAs.ToString().ToUpperInvariant();
-            
+
             CreateEventsJournalSql = $@"
                 CREATE TABLE IF NOT EXISTS {Configuration.FullJournalTableName} (
                     {Configuration.OrderingColumnName} BIGSERIAL NOT NULL PRIMARY KEY,
@@ -67,33 +70,64 @@ namespace Akka.Persistence.PostgreSql.Journal
                     {
                         if (serializerId.HasValue)
                         {
-                            return Serialization.Deserialize((byte[])serialized, serializerId.Value, manifest);
+                            return Serialization.Deserialize((byte[]) serialized, serializerId.Value, manifest);
                         }
                         else
                         {
                             // Support old writes that did not set the serializer id
-                            var deserializer = Serialization.FindSerializerForType(type, Configuration.DefaultSerializer);
-                            return deserializer.FromBinary((byte[])serialized, type);
+                            var deserializer =
+                                Serialization.FindSerializerForType(type, Configuration.DefaultSerializer);
+                            return deserializer.FromBinary((byte[]) serialized, type);
                         }
-                    }; 
+                    };
                     break;
                 case StoredAsType.JsonB:
-                    _serialize = e => new SerializationResult(NpgsqlDbType.Jsonb, JsonConvert.SerializeObject(e.Payload, _configuration.JsonSerializerSettings), null);
-                    _deserialize = (type, serialized, manifest, serializerId) => JsonConvert.DeserializeObject((string)serialized, type, _configuration.JsonSerializerSettings);
+                    _serialize = e => new SerializationResult(NpgsqlDbType.Jsonb,
+                        JsonConvert.SerializeObject(e.Payload, _configuration.JsonSerializerSettings), null);
+                    _deserialize = (type, serialized, manifest, serializerId) =>
+                        JsonConvert.DeserializeObject((string) serialized, type, _configuration.JsonSerializerSettings);
                     break;
                 case StoredAsType.Json:
-                    _serialize = e => new SerializationResult(NpgsqlDbType.Json, JsonConvert.SerializeObject(e.Payload, _configuration.JsonSerializerSettings), null);
-                    _deserialize = (type, serialized, manifest, serializerId) => JsonConvert.DeserializeObject((string)serialized, type, _configuration.JsonSerializerSettings);
+                    _serialize = e => new SerializationResult(NpgsqlDbType.Json,
+                        JsonConvert.SerializeObject(e.Payload, _configuration.JsonSerializerSettings), null);
+                    _deserialize = (type, serialized, manifest, serializerId) =>
+                        JsonConvert.DeserializeObject((string) serialized, type, _configuration.JsonSerializerSettings);
                     break;
                 default:
-                    throw new NotSupportedException($"{_configuration.StoredAs} is not supported Db type for a payload");
+                    throw new NotSupportedException(
+                        $"{_configuration.StoredAs} is not supported Db type for a payload");
             }
         }
 
-        protected override DbCommand CreateCommand(DbConnection connection) => ((NpgsqlConnection)connection).CreateCommand();
+        protected override DbCommand CreateCommand(DbConnection connection) =>
+            ((NpgsqlConnection) connection).CreateCommand();
+
         protected override string CreateEventsJournalSql { get; }
         protected override string CreateMetaTableSql { get; }
+        protected override string AllPersistenceIdsSql => $@"
+                SELECT DISTINCT PersistenceId 
+                FROM {_configuration.FullJournalTableName} e
+                WHERE e.{_configuration.OrderingColumnName} > @Ordering";
 
+        protected override string HighestSequenceNrSql => $@"
+                SELECT MAX(e.SequenceNr) as SequenceNr 
+                FROM {_configuration.FullJournalTableName} e 
+                WHERE e.{_configuration.PersistenceIdColumnName} = @PersistenceId";
+
+        protected override string DeleteBatchSql => $@"
+                DELETE FROM {_configuration.FullJournalTableName}
+                WHERE {_configuration.PersistenceIdColumnName} = @PersistenceId AND {_configuration.SequenceNrColumnName} <= @ToSequenceNr;";
+
+        public override async Task DeleteBatchAsync(DbConnection connection, CancellationToken cancellationToken, string persistenceId, long toSequenceNr)
+        {
+            using (var deleteCommand = GetCommand(connection, DeleteBatchSql))
+            {
+                AddParameter(deleteCommand, "@PersistenceId", DbType.String, persistenceId);
+                AddParameter(deleteCommand, "@ToSequenceNr", DbType.Int64, toSequenceNr);
+                await deleteCommand.ExecuteNonQueryAsync(cancellationToken);
+            }
+        } 
+        
         protected override void WriteEvent(DbCommand command, IPersistentRepresentation e, IImmutableSet<string> tags)
         {
             var serializationResult = _serialize(e);
@@ -102,7 +136,7 @@ namespace Akka.Persistence.PostgreSql.Journal
 
             string manifest = "";
             if (hasSerializer && serializer is SerializerWithStringManifest)
-                manifest = ((SerializerWithStringManifest)serializer).Manifest(e.Payload);
+                manifest = ((SerializerWithStringManifest) serializer).Manifest(e.Payload);
             else if (hasSerializer && serializer.IncludeManifest)
                 manifest = QualifiedName(e);
             else
@@ -123,7 +157,8 @@ namespace Akka.Persistence.PostgreSql.Journal
                 AddParameter(command, "@SerializerId", DbType.Int32, DBNull.Value);
             }
 
-            command.Parameters.Add(new NpgsqlParameter("@Payload", serializationResult.DbType) { Value = serializationResult.Payload });
+            command.Parameters.Add(new NpgsqlParameter("@Payload", serializationResult.DbType)
+                {Value = serializationResult.Payload});
 
             if (tags.Count != 0)
             {
@@ -166,10 +201,11 @@ namespace Akka.Persistence.PostgreSql.Journal
 
             var deserialized = _deserialize(type, raw, manifest, serializerId);
 
-            return new Persistent(deserialized, sequenceNr, persistenceId, manifest, isDeleted, ActorRefs.NoSender, null);
+            return new Persistent(deserialized, sequenceNr, persistenceId, manifest, isDeleted, ActorRefs.NoSender,
+                null);
         }
     }
-    
+
     public class PostgreSqlQueryConfiguration : QueryConfiguration
     {
         public readonly StoredAsType StoredAs;
@@ -191,10 +227,11 @@ namespace Akka.Persistence.PostgreSql.Journal
             TimeSpan timeout,
             StoredAsType storedAs,
             string defaultSerializer,
-            JsonSerializerSettings jsonSerializerSettings = null, 
+            JsonSerializerSettings jsonSerializerSettings = null,
             bool useSequentialAccess = true)
             : base(schemaName, journalEventsTableName, metaTableName, persistenceIdColumnName, sequenceNrColumnName,
-                  payloadColumnName, manifestColumnName, timestampColumnName, isDeletedColumnName, tagsColumnName, orderingColumn, 
+                payloadColumnName, manifestColumnName, timestampColumnName, isDeletedColumnName, tagsColumnName,
+                orderingColumn,
                 serializerIdColumnName, timeout, defaultSerializer, useSequentialAccess)
         {
             StoredAs = storedAs;
