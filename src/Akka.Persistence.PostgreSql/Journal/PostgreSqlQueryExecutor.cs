@@ -105,12 +105,12 @@ namespace Akka.Persistence.PostgreSql.Journal
         protected override string CreateEventsJournalSql { get; }
         protected override string CreateMetaTableSql { get; }
         protected override string AllPersistenceIdsSql => $@"
-                SELECT DISTINCT PersistenceId 
+                SELECT DISTINCT {_configuration.PersistenceIdColumnName}
                 FROM {_configuration.FullJournalTableName} e
                 WHERE e.{_configuration.OrderingColumnName} > @Ordering";
 
         protected override string HighestSequenceNrSql => $@"
-                SELECT MAX(e.SequenceNr) as SequenceNr 
+                SELECT MAX(e.{_configuration.SequenceNrColumnName}) as SequenceNr 
                 FROM {_configuration.FullJournalTableName} e 
                 WHERE e.{_configuration.PersistenceIdColumnName} = @PersistenceId";
 
